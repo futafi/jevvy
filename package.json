@@ -18,7 +18,6 @@
     "check": "npm run typecheck && npm run lint && npm test && npm run build",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
-    "prepare": "effect-tsgo patch --no-typescript --oxlint",
     "pretest": "npm run build:core",
     "pretypecheck": "npm run build:core",
     "smoke:package": "node scripts/package-smoke.mjs",
