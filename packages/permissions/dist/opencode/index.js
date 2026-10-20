@@ -1,0 +1,124 @@
+import { Plugin } from "@opencode/plugin/effect";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodePath from "@effect/platform-node/NodePath";
+import { globalJevvyConfigPath, loadJevvyConfig } from "../config.js";
+import { createPermissionReviewer } from "../engine.js";
+import { createConfiguredProvider, shippedPolicyProvenance } from "../providers.js";
+import { apiKeyFromCredential, withOpenCodeCredential } from "./credential.js";
+import { createEvaluate } from "./evaluate.js";
+import { createCommandCapture } from "./command-capture.js";
+import { hasExplicitAsk } from "./ask-rule.js";
+import { createReviewControl } from "../review-control.js";
+import { JevvyControl } from "./rpc.js";
+import { createReviewCommand } from "./command.js";
+import { invalidConfigurationMessage, missingConfigurationMessage, missingCredentialMessage, missingOpenCodeCredentialMessage, } from "./setup.js";
+class PluginSetupError extends Schema.TaggedError()("PluginSetupError", { message: Schema.String }) {
+}
+export default Plugin.define({
+    id: "jevvy.permissions",
+    effect: Effect.fn("JevvyPlugin.setup")(function* (ctx) {
+        const configPath = globalJevvyConfigPath();
+        const control = yield* createReviewControl(configPath).pipe(Effect.provide(Layer.merge(NodeFileSystem.layer, NodePath.layer)));
+        let problem;
+        const toggle = Effect.fn("JevvyPlugin.toggle")(function* () {
+            const state = yield* control.change("opencode");
+            yield* registration.events.emit("changed", state).pipe(Effect.orDie);
+            return state;
+        });
+        const registration = yield* ctx.rpc.register(JevvyControl, {
+            get: () => control.read("opencode").pipe(Effect.match({
+                onFailure: () => ({ problem: problem ?? `Jevvy could not read ${configPath}. Run npx @jevvy/permissions init or fix the configuration.` }),
+                onSuccess: (state) => problem === undefined ? state : { ...state, problem },
+            })),
+            toggle: () => toggle().pipe(Effect.orDie),
+        }).pipe(Effect.orDie);
+        yield* ctx.command.transform((editor) => {
+            editor.add(createReviewCommand(toggle(), ctx.session, () => problem));
+        });
+        yield* Effect.gen(function* () {
+            const permissionConfig = yield* loadJevvyConfig(configPath).pipe(Effect.provide(NodeFileSystem.layer));
+            if (permissionConfig.kind === "invalid") {
+                return yield* new PluginSetupError({ message: invalidConfigurationMessage(configPath, permissionConfig.message) });
+            }
+            if (permissionConfig.kind === "unconfigured") {
+                return yield* new PluginSetupError({ message: missingConfigurationMessage(configPath) });
+            }
+            const selection = permissionConfig.selection;
+            const resolved = selection.provider === "laya" || selection.provider === "custom"
+                ? selection
+                : yield* withOpenCodeCredential(selection, (integrationID) => Effect.gen(function* () {
+                    const connection = yield* ctx.integration.connection.active(integrationID).pipe(Effect.orElseSucceed(() => undefined));
+                    if (connection === undefined)
+                        return undefined;
+                    const credential = yield* ctx.integration.connection.resolve(connection).pipe(Effect.orElseSucceed(() => undefined));
+                    return apiKeyFromCredential(credential);
+                }));
+            const selected = createConfiguredProvider(resolved);
+            if (selected === undefined) {
+                const provider = resolved.provider;
+                if (provider === "custom") {
+                    return yield* new PluginSetupError({ message: "Jevvy could not construct the configured custom provider" });
+                }
+                if ("opencodeCredential" in resolved && resolved.opencodeCredential !== undefined && resolved.apiKey === undefined) {
+                    return yield* new PluginSetupError({
+                        message: missingOpenCodeCredentialMessage(provider, resolved.opencodeCredential, configPath),
+                    });
+                }
+                return yield* new PluginSetupError({ message: missingCredentialMessage(provider, configPath) });
+            }
+            const questions = permissionConfig.kind === "custom-policy" ? permissionConfig.questions : undefined;
+            const reviewer = yield* createPermissionReviewer(selected.client, {
+                questions,
+                timeoutMs: permissionConfig.timeoutMs,
+            }).pipe(Effect.orDie);
+            const capture = createCommandCapture();
+            yield* ctx.tool.hook("execute.before", capture.before);
+            yield* ctx.shell.hook("create.before", capture.shellBefore);
+            yield* ctx.tool.hook("execute.after", capture.after);
+            const evaluate = createEvaluate(reviewer, {
+                control,
+                inspect: (event) => Effect.gen(function* () {
+                    const command = capture.commandFor(event);
+                    if (command === undefined)
+                        return undefined;
+                    const session = yield* ctx.session.get({ sessionID: event.sessionID });
+                    const agentID = event.agent ?? session.agent;
+                    if (agentID === undefined)
+                        return undefined;
+                    const agent = yield* ctx.agent.get({ agentID, location: { directory: session.location.directory } });
+                    return {
+                        command,
+                        explicitAsk: hasExplicitAsk(event.action, event.resources, [
+                            ...agent.data.permissions,
+                            ...session.permissions ?? [],
+                        ]),
+                    };
+                }).pipe(Effect.orElseSucceed(() => undefined)),
+                report: (entry) => {
+                    if (entry.failure !== undefined) {
+                        console.warn("[jevvy] provider failure, OpenCode's remaining permission flow is unchanged", entry);
+                        return;
+                    }
+                    console.info("[jevvy] permission review", entry);
+                },
+            });
+            yield* ctx.permission.hook("evaluate", evaluate);
+            yield* Effect.sync(() => {
+                console.info("[jevvy] loaded", {
+                    provider: selected.provider,
+                    model: selected.model,
+                    questions: permissionConfig.kind === "custom-policy"
+                        ? "custom"
+                        : shippedPolicyProvenance(selected),
+                    autoApproval: "enabled",
+                });
+            });
+        }).pipe(Effect.catchTag("PluginSetupError", (error) => Effect.sync(() => {
+            problem = error.message;
+            console.warn(problem);
+        })));
+    }),
+});
